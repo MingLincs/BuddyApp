@@ -150,4 +150,22 @@ export async function getDocumentStudyMaterials(
   });
 }
 
+export async function getClassQuizzes(
+  classId: string,
+  accessToken?: string,
+): Promise<{ id: string; title: string; num_questions: number; created_at: string; doc_id: string; doc_title: string }[]> {
+  return fetchJson(`${API_BASE}/classes/${classId}/quizzes`, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+}
+
+export async function getQuizById(
+  quizId: string,
+  accessToken?: string,
+): Promise<{ id: string; title: string; num_questions: number; created_at: string; quiz_json: string; doc_id: string }> {
+  return fetchJson(`${API_BASE}/quizzes/${quizId}`, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+}
+
 // CSV/Anki exports removed
