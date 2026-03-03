@@ -671,6 +671,95 @@ async def generate_document_flashcards(
     }
 
 
+@router.get("/classes/{class_id}/quizzes")
+async def get_class_quizzes(
+    class_id: str,
+    user_id: Optional[str] = Depends(user_id_from_auth_header),
+):
+    """Get all quizzes for a class derived via quizzes.doc_id -> documents.class_id."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    class_id = _valid_uuid(class_id)
+
+    cls_res = (
+        supabase.table("classes")
+        .select("id,name")
+        .eq("id", class_id)
+        .eq("user_id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not cls_res.data:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    docs_res = (
+        supabase.table("documents")
+        .select("id,title")
+        .eq("class_id", class_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    docs = docs_res.data or []
+
+    if not docs:
+        return []
+
+    doc_id_to_title: Dict[str, str] = {d["id"]: d.get("title", "Document") for d in docs}
+    doc_ids = list(doc_id_to_title.keys())
+
+    try:
+        quizzes_res = (
+            supabase.table("quizzes")
+            .select("id,title,num_questions,created_at,doc_id")
+            .in_("doc_id", doc_ids)
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        quizzes = quizzes_res.data or []
+    except Exception as e:
+        logger.warning(f"[get_class_quizzes] query error: {e}")
+        quizzes = []
+
+    return [
+        {
+            "id": q["id"],
+            "title": q.get("title", "Quiz"),
+            "num_questions": q.get("num_questions", 0),
+            "created_at": q.get("created_at", ""),
+            "doc_id": q.get("doc_id", ""),
+            "doc_title": doc_id_to_title.get(q.get("doc_id", ""), "Document"),
+        }
+        for q in quizzes
+    ]
+
+
+@router.get("/quizzes/{quiz_id}")
+async def get_quiz_by_id(
+    quiz_id: str,
+    user_id: Optional[str] = Depends(user_id_from_auth_header),
+):
+    """Get a single quiz by ID including quiz_json."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    quiz_id = _valid_uuid(quiz_id)
+
+    quiz_res = (
+        supabase.table("quizzes")
+        .select("id,title,num_questions,created_at,quiz_json,doc_id")
+        .eq("id", quiz_id)
+        .eq("user_id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not quiz_res.data:
+        raise HTTPException(status_code=404, detail="Quiz not found")
+
+    return quiz_res.data
+
+
 @router.get("/documents/{doc_id}/study-materials")
 async def get_document_study_materials(
     doc_id: str,
