@@ -2,7 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "@supabase/supabase-js";
+import { generateClassFlashcards } from "@/lib/api";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -24,6 +26,8 @@ export default function FlashcardsPage() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [generateError, setGenerateError] = useState("");
   const [filterDifficulty, setFilterDifficulty] = useState('all');
   const [shuffled, setShuffled] = useState(false);
 
@@ -54,6 +58,23 @@ export default function FlashcardsPage() {
       console.error('Flashcards error:', err);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleGenerate() {
+    setGenerateError("");
+    setGenerating(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { router.push('/'); return; }
+      const result = await generateClassFlashcards(String(id), session.access_token);
+      setFlashcards((result.flashcards || []) as Flashcard[]);
+      setCurrentIndex(0);
+      setFlipped(false);
+    } catch (e: unknown) {
+      setGenerateError(e instanceof Error ? e.message : "Failed to generate flashcards.");
+    } finally {
+      setGenerating(false);
     }
   }
 
@@ -103,9 +124,19 @@ export default function FlashcardsPage() {
           <div className="empty-icon">🎴</div>
           <h2>No Flashcards Yet</h2>
           <p>Upload course materials and I'll generate flashcards automatically!</p>
-          <button onClick={() => router.push(`/class/${id}`)}>
-            Upload Materials
-          </button>
+          {generateError && <p style={{color:"#dc2626",fontSize:"14px"}}>{generateError}</p>}
+          <div style={{display:"flex",gap:"12px",flexWrap:"wrap",justifyContent:"center"}}>
+            <button
+              onClick={handleGenerate}
+              disabled={generating}
+              style={{padding:"12px 24px",background:"linear-gradient(135deg,#3b82f6,#2563eb)",color:"white",border:"none",borderRadius:"12px",fontWeight:600,cursor:"pointer"}}
+            >
+              {generating ? "Generating…" : "✨ Generate Flashcards"}
+            </button>
+            <button onClick={() => router.push(`/class/${id}`)}>
+              Upload Materials
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -124,6 +155,15 @@ export default function FlashcardsPage() {
           </div>
           
           <div className="header-controls">
+            <button
+              onClick={handleGenerate}
+              disabled={generating}
+              className="shuffle-button"
+              style={{background:"linear-gradient(135deg,#3b82f6,#2563eb)",color:"white",borderColor:"#3b82f6"}}
+            >
+              {generating ? "Generating…" : "✨ Regenerate"}
+            </button>
+
             <select 
               value={filterDifficulty}
               onChange={(e) => {

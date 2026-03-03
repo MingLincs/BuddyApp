@@ -67,4 +67,87 @@ export async function buildQuiz(
   return { id: data.id, title: data.title, questions: safe.questions as MCQ[] };
 }
 
+// ── Study-material helpers ──────────────────────────────────────────────────
+
+export async function generateClassQuiz(
+  classId: string,
+  accessToken?: string,
+): Promise<{ id: string; title: string; num_questions: number; quiz_json: string }> {
+  return fetchJson(`${API_BASE}/classes/${classId}/generate-quiz`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+  });
+}
+
+export async function generateClassFlashcards(
+  classId: string,
+  accessToken?: string,
+): Promise<{ flashcards: unknown[]; count: number; class_name: string }> {
+  return fetchJson(`${API_BASE}/classes/${classId}/generate-flashcards`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+  });
+}
+
+export async function getClassStudyMaterials(
+  classId: string,
+  accessToken?: string,
+): Promise<{
+  quizzes: { id: string; title: string; num_questions: number; created_at: string }[];
+  flashcard_count: number;
+  has_quizzes: boolean;
+  has_flashcards: boolean;
+}> {
+  return fetchJson(`${API_BASE}/classes/${classId}/study-materials`, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+}
+
+export async function generateDocumentQuiz(
+  docId: string,
+  accessToken?: string,
+): Promise<{ id: string; title: string; num_questions: number; quiz_json: string }> {
+  return fetchJson(`${API_BASE}/documents/${docId}/generate-quiz`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+  });
+}
+
+export async function generateDocumentFlashcards(
+  docId: string,
+  accessToken?: string,
+): Promise<{ flashcards: unknown[]; count: number }> {
+  return fetchJson(`${API_BASE}/documents/${docId}/generate-flashcards`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+  });
+}
+
+export async function getDocumentStudyMaterials(
+  docId: string,
+  accessToken?: string,
+): Promise<{
+  flashcards: unknown[];
+  flashcard_count: number;
+  quizzes: { id: string; title: string; num_questions: number; created_at: string }[];
+  has_flashcards: boolean;
+  has_quizzes: boolean;
+}> {
+  return fetchJson(`${API_BASE}/documents/${docId}/study-materials`, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+}
+
 // CSV/Anki exports removed
