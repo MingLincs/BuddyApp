@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+loguru
+supabase
+openai
+requests
+python-multipart
