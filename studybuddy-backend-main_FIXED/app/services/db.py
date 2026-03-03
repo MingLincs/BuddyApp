@@ -159,7 +159,7 @@ def upsert_document(
 def insert_quiz(
     *,
     user_id: str,
-    doc_id: str,
+    doc_id: str | None = None,
     class_id: str | None = None,
     title: str,
     quiz_json: str,
@@ -167,16 +167,17 @@ def insert_quiz(
 ) -> None:
     sb = supabase()
 
-    sb.table("quizzes").insert(
-        {
-            "doc_id": doc_id,
-            "user_id": user_id,
-            "class_id": class_id,
-            "title": title,
-            "quiz_json": quiz_json,
-            "num_questions": num_questions,
-        }
-    ).execute()
+    row: dict[str, Any] = {
+        "user_id": user_id,
+        "class_id": class_id,
+        "title": title,
+        "quiz_json": quiz_json,
+        "num_questions": num_questions,
+    }
+    if doc_id is not None:
+        row["doc_id"] = doc_id
+
+    sb.table("quizzes").insert(row).execute()
 
 
 # ------------------------------------------------

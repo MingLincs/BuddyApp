@@ -332,7 +332,7 @@ async def generate_class_quiz(
     try:
         insert_quiz(
             user_id=user_id,
-            doc_id=docs[0]["id"],
+            doc_id=None,
             class_id=class_id,
             title=quiz_title,
             quiz_json=quiz_json_str,
