@@ -1,0 +1,70 @@
+import { z } from "zod";
+import { API_BASE } from "./env";
+import { Card, UploadAPIResponse, QuizAPIResponse, MCQ } from "./types";
+import { fetchJson } from "./utils";
+
+const CardSchema = z.object({
+  type: z.string().optional(),
+  front: z.string(),
+  back: z.string(),
+  source: z.string().nullable().optional(),
+});
+const CardsPayloadSchema = z.object({ cards: z.array(CardSchema) });
+
+const MCQSchema = z.object({
+  question: z.string(),
+  choices: z.array(z.string()).length(4),
+  answer_index: z.number().int().min(0).max(3),
+  explanation: z.string(),
+  source: z.string().nullable().optional(),
+});
+const QuizPayloadSchema = z.object({ questions: z.array(MCQSchema) });
+
+export async function uploadSlides(
+  opts: { file: File; title?: string; makeSummary?: boolean; makeCards?: boolean },
+  accessToken?: string
+): Promise<{ id: string; title: string; summary: string; cards: Card[] }> {
+  const fd = new FormData();
+  fd.append("file", opts.file);
+  fd.append("title", opts.title ?? opts.file.name);
+  fd.append("make_summary", opts.makeSummary !== false ? "1" : "0");
+  fd.append("make_cards", opts.makeCards !== false ? "1" : "0");
+
+  const data = await fetchJson<UploadAPIResponse>(`${API_BASE}/upload`, {
+    method: "POST",
+    body: fd,
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+
+  let cards: Card[] = [];
+  if (opts.makeCards !== false) {
+    const cleaned = (data.cards_json ?? "").replace(/```(\w+)?/g, "");
+    const parsed = JSON.parse(cleaned || '{"cards": []}');
+    const safe = CardsPayloadSchema.parse(parsed);
+    cards = safe.cards as Card[];
+  }
+  return { id: data.id, title: data.title, summary: data.summary ?? "", cards };
+}
+
+export async function buildQuiz(
+  opts: { file: File; title?: string; numQuestions?: number },
+  accessToken?: string
+): Promise<{ id: string; title: string; questions: MCQ[] }> {
+  const fd = new FormData();
+  fd.append("file", opts.file);
+  fd.append("title", opts.title ?? opts.file.name);
+  fd.append("num_questions", String(opts.numQuestions ?? 18));
+
+  const data = await fetchJson<QuizAPIResponse>(`${API_BASE}/quiz`, {
+    method: "POST",
+    body: fd,
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+
+  const cleaned = (data.quiz_json ?? "").replace(/```(\w+)?/g, "");
+  const parsed = JSON.parse(cleaned || '{"questions": []}');
+  const safe = QuizPayloadSchema.parse(parsed);
+  return { id: data.id, title: data.title, questions: safe.questions as MCQ[] };
+}
+
+// CSV/Anki exports removed

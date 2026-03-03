@@ -1,0 +1,13 @@
+# Add these to your requirements.txt for the backend
+
+# PDF parsing
+PyPDF2==3.0.1
+
+# iCalendar parsing
+icalendar==5.0.11
+
+# Already have anthropic for Claude API (should be in your requirements already)
+# anthropic==0.34.0  (or whatever version you have)
+
+# Install with:
+# pip install PyPDF2 icalendar --break-system-packages

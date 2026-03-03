@@ -1,0 +1,28 @@
+# Add these imports to your app/main.py
+
+# AFTER the existing router imports (around line 22), ADD:
+from .routers.syllabus import router as syllabus_router
+from .routers.calendar import router as calendar_router
+
+# AFTER the existing app.include_router calls (around line 67), ADD:
+app.include_router(syllabus_router)
+app.include_router(calendar_router)
+
+
+# FULL UPDATED ROUTER SECTION SHOULD LOOK LIKE:
+# ---------- routes ----------
+app.include_router(debug.router)
+app.include_router(upload.router)
+app.include_router(quiz.router)
+app.include_router(library.router)
+app.include_router(classes_router)
+app.include_router(documents_router)
+app.include_router(class_graph_router)
+app.include_router(concepts_detail_router)
+app.include_router(edges_detail_router)
+app.include_router(concept_merge_router)
+app.include_router(graph_jobs_router)
+app.include_router(class_admin.router)
+app.include_router(intelligent_router)
+app.include_router(syllabus_router)      # NEW
+app.include_router(calendar_router)      # NEW
