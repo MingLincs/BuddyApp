@@ -87,29 +87,37 @@ const getAccessToken = async () => {
 
   /* ================= IMPORT HANDLER ================= */
 
-  const handleImport = async (file: File) => {
-    try {
-      const token = localStorage.getItem("token");
+ const handleImport = async (file: File) => {
+  try {
+    const token = await getAccessToken();
 
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const res = await fetch(`${API_BASE}/calendar/import`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        body: formData,
-      });
-
-      if (!res.ok) throw new Error("Import failed");
-
-      await loadAssignments();
-      setShowImportModal(false);
-    } catch (err) {
-      console.error("Import error:", err);
+    if (!token) {
+      console.error("No auth token found. User is not signed in.");
+      return;
     }
-  };
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const res = await fetch(`${API_BASE}/calendar/import`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Import failed: ${res.status} ${errText}`);
+    }
+
+    await loadAssignments();
+    setShowImportModal(false);
+  } catch (err) {
+    console.error("Import error:", err);
+  }
+};
 
   /* ================= RENDER ================= */
 
