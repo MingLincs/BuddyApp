@@ -160,16 +160,18 @@ def insert_quiz(
     *,
     user_id: str,
     doc_id: str | None = None,
-    class_id: str | None = None,
     title: str,
     quiz_json: str,
     num_questions: int,
 ) -> None:
+    """Insert a document-level quiz into the quizzes table.
+    Note: quizzes table has no class_id column; class-level quizzes
+    are stored in study_materials.quiz_questions instead.
+    """
     sb = supabase()
 
     row: dict[str, Any] = {
         "user_id": user_id,
-        "class_id": class_id,
         "title": title,
         "quiz_json": quiz_json,
         "num_questions": num_questions,
@@ -178,6 +180,48 @@ def insert_quiz(
         row["doc_id"] = doc_id
 
     sb.table("quizzes").insert(row).execute()
+
+
+def upsert_study_material(
+    *,
+    class_id: str,
+    document_id: str | None = None,
+    material_type: str,
+    subject_area: str = "other",
+    flashcards: str | None = None,
+    quiz_questions: str | None = None,
+    concept_ids: list | None = None,
+) -> None:
+    """Upsert a row in study_materials for class-level quiz/flashcard storage."""
+    sb = supabase()
+
+    row: dict[str, Any] = {
+        "class_id": class_id,
+        "material_type": material_type,
+        "subject_area": subject_area,
+    }
+    if document_id is not None:
+        row["document_id"] = document_id
+    if flashcards is not None:
+        row["flashcards"] = flashcards
+    if quiz_questions is not None:
+        row["quiz_questions"] = quiz_questions
+    if concept_ids is not None:
+        row["concept_ids"] = concept_ids
+
+    # Try to update an existing row for this (class_id, material_type); insert if missing
+    existing = (
+        sb.table("study_materials")
+        .select("id")
+        .eq("class_id", class_id)
+        .eq("material_type", material_type)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        sb.table("study_materials").update(row).eq("id", existing.data[0]["id"]).execute()
+    else:
+        sb.table("study_materials").insert(row).execute()
 
 
 # ------------------------------------------------

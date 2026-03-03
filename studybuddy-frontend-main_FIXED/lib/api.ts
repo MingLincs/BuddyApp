@@ -99,7 +99,7 @@ export async function getClassStudyMaterials(
   classId: string,
   accessToken?: string,
 ): Promise<{
-  quizzes: { id: string; title: string; num_questions: number; created_at: string }[];
+  quizzes: { id: string; title: string; num_questions: number; created_at: string; quiz_json?: string }[];
   flashcard_count: number;
   has_quizzes: boolean;
   has_flashcards: boolean;
