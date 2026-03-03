@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { getSupabaseBrowser } from "@/lib/supabaseBrowser";
+import { getClassStudyMaterials } from "@/lib/api";
 
 type ClassRow = {
   id: string;
@@ -19,6 +20,13 @@ type Doc = {
   created_at: string;
 };
 
+type StudyMaterials = {
+  has_quizzes: boolean;
+  has_flashcards: boolean;
+  flashcard_count: number;
+  quizzes: { id: string }[];
+};
+
 export default function EnhancedClassPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
@@ -27,6 +35,7 @@ export default function EnhancedClassPage() {
   const [cls, setCls] = useState<ClassRow | null>(null);
   const [docs, setDocs] = useState<Doc[]>([]);
   const [loading, setLoading] = useState(true);
+  const [materials, setMaterials] = useState<StudyMaterials | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -52,6 +61,18 @@ export default function EnhancedClassPage() {
 
       setCls((c as ClassRow) || null);
       setDocs((d as Doc[]) || []);
+
+      // Load study materials metadata
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session) {
+          const mats = await getClassStudyMaterials(id, session.access_token);
+          if (alive) setMaterials(mats);
+        }
+      } catch {
+        // non-critical – silently ignore
+      }
+
       setLoading(false);
     })();
 
@@ -119,12 +140,24 @@ export default function EnhancedClassPage() {
               <div className="feature-icon">🎴</div>
               <h3>Flashcards</h3>
               <p>Auto-generated cards</p>
+              {materials?.has_flashcards && (
+                <span className="feature-badge">{materials.flashcard_count} cards</span>
+              )}
+              {docs.length > 0 && !materials?.has_flashcards && (
+                <span className="feature-badge generate-badge">Generate →</span>
+              )}
             </Link>
 
             <Link href={`/class/${id}/quiz`} className="feature-card">
               <div className="feature-icon">📝</div>
               <h3>Practice Quiz</h3>
               <p>Test your knowledge</p>
+              {materials?.has_quizzes && (
+                <span className="feature-badge">{materials.quizzes.length} quiz{materials.quizzes.length !== 1 ? "zes" : ""}</span>
+              )}
+              {docs.length > 0 && !materials?.has_quizzes && (
+                <span className="feature-badge generate-badge">Generate →</span>
+              )}
             </Link>
 
             <Link href={`/class/${id}/help`} className="feature-card">
@@ -367,6 +400,10 @@ export default function EnhancedClassPage() {
           border-radius: 6px;
           font-size: 12px;
           font-weight: 600;
+        }
+
+        .generate-badge {
+          background: #3b82f6;
         }
 
         .syllabus-cta {

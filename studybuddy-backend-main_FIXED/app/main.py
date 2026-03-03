@@ -29,6 +29,7 @@ from .routers.graph_jobs import router as graph_jobs_router
 from .routers.intelligent_processing import router as intelligent_router
 from .routers.syllabus import router as syllabus_router
 from .routers.calendar import router as calendar_router
+from .routers.study_materials import router as study_materials_router
 # ---------- logging ----------
 logger.remove()
 logger.add(
@@ -75,3 +76,4 @@ app.include_router(graph_jobs_router)
 app.include_router(intelligent_router)
 app.include_router(syllabus_router)
 app.include_router(calendar_router)
+app.include_router(study_materials_router)
