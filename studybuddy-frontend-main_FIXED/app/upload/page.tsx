@@ -1,24 +1,35 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { API_BASE } from "@/lib/env";
 
 type ClassRow = { id: string; name: string; created_at: string };
-type Status = "idle" | "uploading" | "done" | "error";
+type Status = "idle" | "uploading" | "processing" | "done" | "error";
+
+const STAGE_LABELS: Record<string, string> = {
+  queued: "Queued…",
+  classifying: "Classifying document…",
+  extracting_concepts: "Extracting concepts…",
+  generating_summary: "Generating summary…",
+  building_materials: "Building study materials…",
+  finalizing: "Finalising…",
+  completed: "Done!",
+};
 
 export default function IntelligentUploadPage() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
   const [classes, setClasses] = useState<ClassRow[]>([]);
   const [classId, setClassId] = useState<string>("");
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [newClassName, setNewClassName] = useState("");
   const [status, setStatus] = useState<Status>("idle");
+  const [stage, setStage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<any>(null);
 
-  const canUpload = !!file && !!classId && status !== "uploading";
+  const canUpload = !!file && !!classId && status !== "uploading" && status !== "processing";
 
   const loadClasses = useMemo(
     () => async () => {
@@ -41,6 +52,15 @@ export default function IntelligentUploadPage() {
     loadClasses();
   }, [loadClasses]);
 
+  // Clear polling interval on unmount to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current !== null) {
+        clearInterval(pollingRef.current);
+      }
+    };
+  }, []);
+
   const createClass = async () => {
     const name = newClassName.trim();
     if (!name) return;
@@ -59,7 +79,7 @@ export default function IntelligentUploadPage() {
         body: JSON.stringify({ name }),
       });
       if (!res.ok) throw new Error("Failed to create class");
-      
+
       await loadClasses();
       const created = await res.json();
       setClassId(created.id);
@@ -72,18 +92,26 @@ export default function IntelligentUploadPage() {
   const handleIntelligentUpload = async () => {
     if (!file || !classId) return;
     setStatus("uploading");
+    setStage("uploading");
     setError(null);
-    setResult(null);
 
+    let token: string;
     try {
       const { data: session } = await supabase.auth.getSession();
-      const token = session.session?.access_token;
+      token = session.session?.access_token ?? "";
       if (!token) throw new Error("Please sign in first");
+    } catch (e: unknown) {
+      setStatus("error");
+      setError(e instanceof Error ? e.message : "Auth error");
+      return;
+    }
 
+    // POST the file – this returns quickly with document_id
+    let documentId: string;
+    try {
       const fd = new FormData();
       fd.append("file", file);
 
-      // Use the NEW intelligent endpoint
       const res = await fetch(`${API_BASE}/intelligent/process-document/${classId}`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
@@ -96,12 +124,54 @@ export default function IntelligentUploadPage() {
       }
 
       const data = await res.json();
-      setResult(data);
-      setStatus("done");
+      documentId = data.document_id;
     } catch (e: unknown) {
       setStatus("error");
       setError(e instanceof Error ? e.message : "Upload failed");
+      return;
     }
+
+    // Poll the status endpoint until processing finishes
+    setStatus("processing");
+    setStage("queued");
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/intelligent/status/${documentId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return false;
+
+        const job = await res.json();
+        setStage(job.stage ?? "");
+
+        if (job.status === "completed") {
+          setStatus("done");
+          if (pollingRef.current !== null) clearInterval(pollingRef.current);
+          router.push(`/doc/${documentId}`);
+          return true;
+        }
+        if (job.status === "failed") {
+          setStatus("error");
+          setError(job.error || "Processing failed");
+          if (pollingRef.current !== null) clearInterval(pollingRef.current);
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
+    pollingRef.current = setInterval(async () => {
+      await poll();
+    }, 2000);
+  };
+
+  const progressLabel = () => {
+    if (status === "uploading") return "Uploading file…";
+    if (status === "processing") return STAGE_LABELS[stage] ?? "Processing…";
+    return "";
   };
 
   return (
@@ -222,72 +292,48 @@ export default function IntelligentUploadPage() {
             disabled={!canUpload}
             className="upload-button"
           >
-            {status === "uploading" ? (
+            {status === "uploading" || status === "processing" ? (
               <>
                 <span className="button-spinner"></span>
-                Processing with AI...
+                {progressLabel()}
               </>
             ) : (
               "🚀 Upload & Process"
             )}
           </button>
 
+          {/* Progress stages */}
+          {status === "processing" && (
+            <div className="progress-stages">
+              {[
+                { key: "classifying", label: "Classifying document" },
+                { key: "extracting_concepts", label: "Extracting concepts" },
+                { key: "generating_summary", label: "Generating summary" },
+                { key: "building_materials", label: "Building study materials" },
+                { key: "finalizing", label: "Finalising" },
+              ].map(({ key, label }) => {
+                const stageOrder = [
+                  "queued", "classifying", "extracting_concepts",
+                  "generating_summary", "building_materials", "finalizing", "completed",
+                ];
+                const currentIdx = stageOrder.indexOf(stage);
+                const itemIdx = stageOrder.indexOf(key);
+                const isDone = currentIdx > itemIdx;
+                const isActive = stage === key;
+                return (
+                  <div key={key} className={`stage-item ${isDone ? "done" : isActive ? "active" : "pending"}`}>
+                    <span className="stage-icon">{isDone ? "✅" : isActive ? "⏳" : "○"}</span>
+                    <span className="stage-label">{label}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {/* Error */}
           {error && (
             <div className="error-message">
               <span>❌</span> {error}
-            </div>
-          )}
-
-          {/* Success */}
-          {status === "done" && result && (
-            <div className="success-message">
-              <div className="success-header">
-                <span>✅</span>
-                <strong>{result.message}</strong>
-              </div>
-
-              {result.document_type === "syllabus" && (
-                <div className="success-details">
-                  <h4>Syllabus Processed!</h4>
-                  <p>
-                    • {result.syllabus_summary?.weeks} weeks scheduled<br />
-                    • {result.syllabus_summary?.assessments} assessments tracked<br />
-                    • Complete study timeline created
-                  </p>
-                  <button
-                    onClick={() => router.push(`/class/${classId}/dashboard`)}
-                    className="view-dashboard-button"
-                  >
-                    View Your Study Plan →
-                  </button>
-                </div>
-              )}
-
-              {result.document_type !== "syllabus" && result.stats && (
-                <div className="success-details">
-                  <h4>Materials Generated!</h4>
-                  <p>
-                    • {result.stats.concepts_extracted} concepts extracted<br />
-                    • {result.stats.flashcards_created} flashcards created<br />
-                    • {result.stats.quiz_questions} quiz questions generated
-                  </p>
-                  <div className="success-actions">
-                    <button
-                      onClick={() => router.push(`/class/${classId}/flashcards`)}
-                      className="action-button"
-                    >
-                      🎴 Study Flashcards
-                    </button>
-                    <button
-                      onClick={() => router.push(`/class/${classId}/concept-map`)}
-                      className="action-button"
-                    >
-                      🗺️ View Concept Map
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
           )}
         </div>
@@ -299,19 +345,19 @@ export default function IntelligentUploadPage() {
             <h3>Smart Classification</h3>
             <p>Automatically detects STEM, Humanities, Social Science, etc.</p>
           </div>
-          
+
           <div className="feature-card">
             <div className="feature-icon">🎴</div>
             <h3>Auto Flashcards</h3>
             <p>Generates subject-appropriate flashcards instantly</p>
           </div>
-          
+
           <div className="feature-card">
             <div className="feature-icon">📝</div>
             <h3>Practice Quizzes</h3>
             <p>Creates quizzes tailored to your subject</p>
           </div>
-          
+
           <div className="feature-card">
             <div className="feature-icon">📅</div>
             <h3>Semester Timeline</h3>
@@ -592,6 +638,43 @@ export default function IntelligentUploadPage() {
           to { transform: rotate(360deg); }
         }
 
+        .progress-stages {
+          margin-top: 16px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          padding: 16px;
+          background: #f8fafc;
+          border-radius: 12px;
+          border: 1px solid #e2e8f0;
+        }
+
+        .stage-item {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          font-size: 14px;
+        }
+
+        .stage-item.done .stage-label {
+          color: #15803d;
+          text-decoration: line-through;
+        }
+
+        .stage-item.active .stage-label {
+          color: #1d4ed8;
+          font-weight: 600;
+        }
+
+        .stage-item.pending .stage-label {
+          color: #94a3b8;
+        }
+
+        .stage-icon {
+          width: 20px;
+          text-align: center;
+        }
+
         .error-message {
           padding: 16px;
           background: #fee2e2;
@@ -601,71 +684,6 @@ export default function IntelligentUploadPage() {
           margin-top: 16px;
           display: flex;
           gap: 8px;
-        }
-
-        .success-message {
-          padding: 20px;
-          background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-          border: 2px solid #10b981;
-          border-radius: 12px;
-          margin-top: 16px;
-        }
-
-        .success-header {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          color: #065f46;
-          margin-bottom: 16px;
-        }
-
-        .success-details h4 {
-          margin: 0 0 8px 0;
-          color: #065f46;
-        }
-
-        .success-details p {
-          margin: 0 0 16px 0;
-          color: #065f46;
-          line-height: 1.8;
-        }
-
-        .view-dashboard-button {
-          padding: 12px 24px;
-          background: #10b981;
-          color: white;
-          border: none;
-          border-radius: 8px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .view-dashboard-button:hover {
-          background: #059669;
-          transform: translateY(-2px);
-        }
-
-        .success-actions {
-          display: flex;
-          gap: 8px;
-        }
-
-        .action-button {
-          flex: 1;
-          padding: 10px 16px;
-          background: white;
-          border: 2px solid #10b981;
-          border-radius: 8px;
-          color: #10b981;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .action-button:hover {
-          background: #10b981;
-          color: white;
         }
 
         .features-grid {

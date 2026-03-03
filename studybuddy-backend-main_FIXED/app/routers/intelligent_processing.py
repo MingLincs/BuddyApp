@@ -6,11 +6,12 @@ Goal:
 - Works with your CURRENT schema (documents.user_id, documents.pdf_path, etc.)
 - Adds "intelligence" without breaking existing upload/library endpoints
 - Supports ALL subjects by routing through the classifier + subject-aware extractors
+- Returns immediately after storage upload; heavy AI work runs in the background.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from typing import Any, Dict, Optional
 import json
 import asyncio
@@ -26,12 +27,16 @@ from ..services.auto_study_materials import generate_all_materials
 from ..services.syllabus_processor import process_syllabus, get_this_weeks_tasks, generate_exam_prep_plan
 from ..services.concept_engine import update_class_graph
 from ..services.cache import sha256_bytes
-from ..services.llm import llm
 from ..services.db import new_uuid, upload_pdf_to_storage, upsert_document
+from ..services.job_store import create_job, update_job, get_job
+from ..services.summary import make_markdown_summary
 from ..supabase import supabase
 
 
 router = APIRouter(prefix="/intelligent", tags=["intelligent"])
+
+# Keep strong references to running background tasks to prevent GC cancellation.
+_background_tasks: set[asyncio.Task] = set()
 
 
 # -----------------------------
@@ -63,122 +68,165 @@ def _to_concept_prompt_shape(unified_concepts: list[dict[str, Any]]) -> dict[str
     return {"concepts": out}
 
 
-async def _make_markdown_summary(text_content: str, word_target: int = 1600) -> str:
+# -----------------------------
+# background processing task
+# -----------------------------
+
+async def _background_process_document(
+    *,
+    doc_id: str,
+    class_id: str,
+    user_id: str,
+    text_content: str,
+    filename: str,
+    pdf_path: str,
+    content_hash: str,
+) -> None:
     """
-    Same style as before, but:
-    - does NOT truncate input to 18k chars
-    - chunks full doc -> summarizes chunks -> merges
-    - forces LaTeX for equations
+    Full AI pipeline executed in the background after the HTTP response is sent.
+    Uses the high-quality chunked summary (make_markdown_summary from services.summary).
     """
-    import re
-    import asyncio
+    try:
+        update_job(doc_id, status="processing", stage="classifying")
 
-    src_full = (text_content or "").strip()
-    if not src_full:
-        return ""
+        # 1) Classify
+        classification = await classify_and_recommend(text_content)
+        cls = classification.get("classification", {}) if isinstance(classification, dict) else {}
+        doc_type = (cls.get("document_type") or "document").lower()
+        subject_area = (cls.get("subject_area") or "other").lower()
 
-    # Keep your original "study notes" style prompt, just add LaTeX rules
-    system_prompt = (
-        f"Write detailed structured study notes in markdown (~{word_target} words). "
-        "Use headings and subheadings, bullets, and clear spacing. "
-        "Make it readable for studying.\n\n"
-        "FORMATTING RULES (must follow):\n"
-        "- If you write ANY equation/math, ALWAYS write it in LaTeX.\n"
-        "- Inline math: $f(x)=x^2$.\n"
-        "- Display math for multi-step:\n"
-        "  $$\n"
-        "  f(2)=2^2+3\\cdot2-4=6\n"
-        "  $$\n"
-        "- Use \\cdot, \\frac, \\sqrt, \\mathbb{R}, \\neq, \\ge, \\le.\n"
-        "- Do NOT end mid-sentence.\n"
-    )
+        # 2) Syllabus path
+        if doc_type == "syllabus":
+            update_job(doc_id, stage="generating_summary")
+            syllabus_data = await process_syllabus(text_content)
+            summary_md = await make_markdown_summary(text_content, word_target=1200)
 
-    # Clean common PDF UI junk that pollutes notes
-    def _clean_pdf_noise(s: str) -> str:
-        s = s.replace("\x00", " ")
-        s = re.sub(r"(?im)^\s*(summary|export\s*pdf|download)\s*$", "", s)
-        s = re.sub(r"(?im)^\s*\d+\s*\$\s*\.?\s*$", "", s)
-        s = re.sub(r"[ \t]+", " ", s)
-        s = re.sub(r"\n{3,}", "\n\n", s)
-        return s.strip()
+            upsert_document(
+                user_id=user_id,
+                doc_id=doc_id,
+                class_id=class_id,
+                title=filename or "Syllabus",
+                summary=summary_md,
+                cards_json=json.dumps({"cards": []}),
+                guide_json=json.dumps({"concepts": []}),
+                pdf_path=pdf_path,
+                content_hash=content_hash,
+            )
 
-    src_full = _clean_pdf_noise(src_full)
+            try:
+                supabase.table("syllabus_data").upsert({
+                    "class_id": class_id,
+                    "document_id": doc_id,
+                    "course_info": syllabus_data.get("course_info", {}),
+                    "schedule": syllabus_data.get("schedule", []),
+                    "assessments": syllabus_data.get("assessments", []),
+                    "grading": syllabus_data.get("grading_breakdown", {}),
+                    "study_timeline": syllabus_data.get("study_timeline", []),
+                }, on_conflict="document_id").execute()
+            except Exception as e:
+                logger.warning(f"[syllabus_data] insert failed: {e}")
 
-    # Allow much more text than 18k (adjust up if you want)
-    src_full = src_full[:90000]
+            try:
+                supabase.table("classes").update({
+                    "subject_area": subject_area,
+                    "has_syllabus": True,
+                }).eq("id", class_id).eq("user_id", user_id).execute()
+            except Exception as e:
+                logger.warning(f"[classes] could not update: {e}")
 
-    # Chunking
-    chunk_size = 14000
-    overlap = 900
-    chunks = []
-    i = 0
-    while i < len(src_full):
-        j = min(len(src_full), i + chunk_size)
-        chunks.append(src_full[i:j])
-        if j == len(src_full):
-            break
-        i = max(0, j - overlap)
+            try:
+                supabase.table("document_intelligence").upsert({
+                    "document_id": doc_id,
+                    "class_id": class_id,
+                    "user_id": user_id,
+                    "document_type": doc_type,
+                    "subject_area": subject_area,
+                    "classification": classification,
+                }, on_conflict="document_id").execute()
+            except Exception as e:
+                logger.warning(f"[document_intelligence] insert failed: {e}")
 
-    # Summarize each chunk with enough room to be detailed
-    per_chunk_words = max(650, int(word_target / max(1, min(len(chunks), 3))))
+            update_job(doc_id, status="completed", stage="completed",
+                       document_type="syllabus",
+                       syllabus_summary={
+                           "weeks": len(syllabus_data.get("schedule", [])),
+                           "assessments": len(syllabus_data.get("assessments", [])),
+                           "course_name": (syllabus_data.get("course_info", {}) or {}).get("name"),
+                       })
+            return
 
-    async def summarize_chunk(chunk: str) -> str:
-        return await llm(
-            [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{chunk}\n\n"
-                        "INSTRUCTIONS:\n"
-                        f"- Write dense, complete study notes (~{per_chunk_words}–{per_chunk_words+300} words).\n"
-                        "- Include definitions, rules/tests, and examples.\n"
-                        "- Use headings/subheadings and bullets.\n"
-                        "- End cleanly.\n"
-                    ),
-                },
-            ],
-            max_tokens=3200,
-            temperature=0.2,
+        # 3) Knowledge graph extraction
+        update_job(doc_id, stage="extracting_concepts")
+        graph = await extract_knowledge_graph(text_content, max_nodes=12)
+        concepts = graph.get("concepts", []) if isinstance(graph, dict) else []
+
+        concepts_for_materials: list[dict[str, Any]] = []
+        if isinstance(concepts, list):
+            for c in concepts:
+                concepts_for_materials.append({
+                    "name": c.get("name"),
+                    "definition": c.get("detailed") or c.get("simple") or "",
+                    "example": c.get("example") or "",
+                })
+
+        mode = (graph.get("meta", {}) or {}).get("extraction_mode") if isinstance(graph, dict) else None
+        subject_for_materials = mode if mode in {"stem", "humanities", "social_science"} else subject_area
+
+        # 4) Summary + materials in parallel (high-quality chunked summary preserved)
+        update_job(doc_id, stage="generating_summary")
+        materials_task = generate_all_materials(concepts_for_materials, subject_for_materials)
+        summary_task = make_markdown_summary(text_content, word_target=1600)
+        materials, summary_md = await asyncio.gather(materials_task, summary_task)
+
+        update_job(doc_id, stage="building_materials")
+        flashcards = materials.get("flashcards", []) if isinstance(materials, dict) else []
+        cards_json = json.dumps({"cards": flashcards}, ensure_ascii=False)
+        guide_json = json.dumps(graph, ensure_ascii=False)
+
+        # 5) Persist final document
+        update_job(doc_id, stage="finalizing")
+        upsert_document(
+            user_id=user_id,
+            doc_id=doc_id,
+            class_id=class_id,
+            title=filename or "Document",
+            summary=summary_md or "",
+            cards_json=cards_json,
+            guide_json=guide_json,
+            pdf_path=pdf_path,
+            content_hash=content_hash,
         )
 
-    parts = await asyncio.gather(*[summarize_chunk(c) for c in chunks])
-    parts = [p.strip() for p in parts if (p or "").strip()]
-    if not parts:
-        return ""
+        # 6) Update concept graph
+        try:
+            await update_class_graph(class_id=class_id, doc_id=doc_id, guide_json=guide_json)
+        except Exception as e:
+            logger.warning(f"[graph] update_class_graph failed: {e}")
 
-    # Merge (pairwise so we don't have to slice input)
-    async def merge_two(a: str, b: str) -> str:
-        return await llm(
-            [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Combine these two note sets into ONE cohesive set.\n"
-                        "- Keep the same style.\n"
-                        "- Preserve details (do not over-compress).\n"
-                        "- Remove duplicates.\n"
-                        "- Keep LaTeX math.\n\n"
-                        f"NOTES A:\n{a}\n\nNOTES B:\n{b}"
-                    ),
-                },
-            ],
-            max_tokens=3800,
-            temperature=0.15,
-        )
+        # 7) Save classification metadata
+        try:
+            supabase.table("document_intelligence").upsert({
+                "document_id": doc_id,
+                "class_id": class_id,
+                "user_id": user_id,
+                "document_type": doc_type,
+                "subject_area": subject_area,
+                "classification": classification,
+            }, on_conflict="document_id").execute()
+        except Exception as e:
+            logger.warning(f"[document_intelligence] insert failed: {e}")
 
-    merged = parts
-    while len(merged) > 1:
-        next_round = []
-        for k in range(0, len(merged), 2):
-            if k + 1 < len(merged):
-                next_round.append((await merge_two(merged[k], merged[k + 1])).strip())
-            else:
-                next_round.append(merged[k])
-        merged = next_round
+        update_job(doc_id, status="completed", stage="completed",
+                   document_type=doc_type, subject_area=subject_area,
+                   stats={
+                       "concepts_extracted": len(concepts) if isinstance(concepts, list) else 0,
+                       "flashcards_created": len(flashcards),
+                       "materials_generated": True,
+                   })
 
-    return merged[0].strip()
+    except Exception as exc:
+        logger.error(f"[background] processing failed for {doc_id}: {exc}")
+        update_job(doc_id, status="failed", stage="failed", error=str(exc))
 
 
 # -----------------------------
@@ -193,13 +241,10 @@ async def process_document_intelligent(
 ):
     """
     Upload ANY document and get subject-aware study materials.
-    Compatible with your existing schema + UI.
 
-    Writes:
-    - documents: summary, cards_json, guide_json, pdf_path, user_id, class_id
-    - document_intelligence (optional table): classification + subject metadata
-    - concepts/edges via update_class_graph (your existing concept engine)
-    - syllabus_data (optional table) for syllabi
+    Returns immediately after file upload + placeholder creation.
+    All AI processing (classification, summary, flashcards, graph) runs in the
+    background. Poll GET /intelligent/status/{document_id} for progress.
     """
 
     if not user_id:
@@ -213,165 +258,90 @@ async def process_document_intelligent(
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF supported")
 
-    # 1) Extract text
-    text_content = extract_text_from_pdf(raw) or ""
-    if len(text_content.strip()) < 100:
-        raise HTTPException(status_code=400, detail="Could not extract text from document")
-
-    # 2) Classify
-    classification = await classify_and_recommend(text_content)
-    cls = classification.get("classification", {}) if isinstance(classification, dict) else {}
-    doc_type = (cls.get("document_type") or "document").lower()
-    subject_area = (cls.get("subject_area") or "other").lower()
-
-    # 3) Create doc + upload pdf (so download/summary-pdf endpoints keep working)
+    # Upload PDF to storage + create placeholder doc immediately
     doc_id = new_uuid()
     content_hash = sha256_bytes(raw)
+    filename = file.filename or "document.pdf"
+
     pdf_path = upload_pdf_to_storage(
         user_id=user_id,
         doc_id=doc_id,
         raw_pdf=raw,
-        filename=file.filename or "document.pdf",
+        filename=filename,
     )
 
-    # 4) Syllabus special path
-    if doc_type == "syllabus":
-        syllabus_data = await process_syllabus(text_content)
-
-        # Create a nice markdown summary too (what your UI expects)
-        summary_md = await _make_markdown_summary(text_content, word_target=1200)
-
-        # Store the document (minimal + compatible)
-        upsert_document(
-            user_id=user_id,
-            doc_id=doc_id,
-            class_id=class_id,
-            title=file.filename or "Syllabus",
-            summary=summary_md,
-            cards_json=json.dumps({"cards": []}),
-            guide_json=json.dumps({"concepts": []}),
-            pdf_path=pdf_path,
-            content_hash=content_hash,
-        )
-
-        # Try to store syllabus detail (requires optional table; if missing, we skip safely)
-        try:
-            supabase.table("syllabus_data").upsert({
-                "class_id": class_id,
-                "document_id": doc_id,
-                "course_info": syllabus_data.get("course_info", {}),
-                "schedule": syllabus_data.get("schedule", []),
-                "assessments": syllabus_data.get("assessments", []),
-                "grading": syllabus_data.get("grading_breakdown", {}),
-                "study_timeline": syllabus_data.get("study_timeline", []),
-            }, on_conflict="document_id").execute()
-        except Exception as e:
-            logger.warning(f"[syllabus_data] table missing or insert failed: {e}")
-
-        # Update class metadata (columns are optional; if missing, we skip safely)
-        try:
-            supabase.table("classes").update({
-                "subject_area": subject_area,
-                "has_syllabus": True,
-            }).eq("id", class_id).eq("user_id", user_id).execute()
-        except Exception as e:
-            logger.warning(f"[classes] could not update subject_area/has_syllabus: {e}")
-
-        # Save classification metadata if table exists
-        try:
-            supabase.table("document_intelligence").upsert({
-                "document_id": doc_id,
-                "class_id": class_id,
-                "user_id": user_id,
-                "document_type": doc_type,
-                "subject_area": subject_area,
-                "classification": classification,
-            }, on_conflict="document_id").execute()
-        except Exception as e:
-            logger.warning(f"[document_intelligence] insert failed: {e}")
-
-        return {
-            "success": True,
-            "document_id": doc_id,
-            "document_type": "syllabus",
-            "subject_area": subject_area,
-            "message": "✓ Syllabus processed. Class timeline and study plan generated.",
-            "syllabus_summary": {
-                "weeks": len(syllabus_data.get("schedule", [])),
-                "assessments": len(syllabus_data.get("assessments", [])),
-                "course_name": (syllabus_data.get("course_info", {}) or {}).get("name"),
-            },
-        }
-
-    # 5) High-signal extraction (works across all classes)
-    graph = await extract_knowledge_graph(text_content, max_nodes=12)
-    concepts = graph.get("concepts", []) if isinstance(graph, dict) else []
-
-    # Convert to the simple shape used by your materials generator
-    concepts_for_materials = []
-    if isinstance(concepts, list):
-        for c in concepts:
-            concepts_for_materials.append({
-                "name": c.get("name"),
-                "definition": c.get("detailed") or c.get("simple") or "",
-                "example": c.get("example") or "",
-            })
-
-    mode = (graph.get("meta", {}) or {}).get("extraction_mode") if isinstance(graph, dict) else None
-    subject_for_materials = mode if mode in {"stem", "humanities", "social_science"} else subject_area
-
-    # 6) Generate materials + markdown summary for your UI
-    materials_task = generate_all_materials(concepts_for_materials, subject_for_materials)
-    summary_task = _make_markdown_summary(text_content, word_target=1600)
-    materials, summary_md = await asyncio.gather(materials_task, summary_task)
-
-    flashcards = materials.get("flashcards", []) if isinstance(materials, dict) else []
-    cards_json = json.dumps({"cards": flashcards}, ensure_ascii=False)
-    guide_json = json.dumps(graph, ensure_ascii=False)
-
-    # 7) Store document (compatible)
+    # Create placeholder document row so downstream routes work right away
     upsert_document(
         user_id=user_id,
         doc_id=doc_id,
         class_id=class_id,
-        title=file.filename or "Document",
-        summary=summary_md or "",
-        cards_json=cards_json,
-        guide_json=guide_json,
+        title=filename,
+        summary="",
+        cards_json=json.dumps({"cards": []}),
+        guide_json=json.dumps({"concepts": []}),
         pdf_path=pdf_path,
         content_hash=content_hash,
     )
 
-    # 8) Update concept graph (your existing engine)
-    try:
-        await update_class_graph(class_id=class_id, doc_id=doc_id, guide_json=guide_json)
-    except Exception as e:
-        logger.warning(f"[graph] update_class_graph failed: {e}")
+    # Register job so the status endpoint can report progress
+    create_job(doc_id)
 
-    # 9) Save classification metadata if table exists
-    try:
-        supabase.table("document_intelligence").upsert({
-            "document_id": doc_id,
-            "class_id": class_id,
-            "user_id": user_id,
-            "document_type": doc_type,
-            "subject_area": subject_area,
-            "classification": classification,
-        }, on_conflict="document_id").execute()
-    except Exception as e:
-        logger.warning(f"[document_intelligence] insert failed: {e}")
+    # Extract text synchronously (fast – no AI, just PyMuPDF)
+    text_content = extract_text_from_pdf(raw) or ""
+    if len(text_content.strip()) < 100:
+        update_job(doc_id, status="failed", stage="failed",
+                   error="Could not extract text from document")
+        raise HTTPException(status_code=400, detail="Could not extract text from document")
+
+    # Fire background AI processing – response is sent immediately
+    task = asyncio.create_task(
+        _background_process_document(
+            doc_id=doc_id,
+            class_id=class_id,
+            user_id=user_id,
+            text_content=text_content,
+            filename=filename,
+            pdf_path=pdf_path,
+            content_hash=content_hash,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
-        "success": True,
         "document_id": doc_id,
-        "document_type": doc_type,
-        "subject_area": subject_area,
-        "stats": {
-            "concepts_extracted": len(concepts) if isinstance(concepts, list) else 0,
-            "flashcards_created": len(flashcards),
-            "materials_generated": True,
-        },
+        "status": "queued",
+        "status_url": f"/intelligent/status/{doc_id}",
     }
+
+
+# -----------------------------
+# status polling endpoint
+# -----------------------------
+
+@router.get("/status/{doc_id}")
+async def get_processing_status(
+    doc_id: str,
+    user_id: str = Depends(user_id_from_auth_header),
+):
+    """
+    Poll the processing status of a document after upload.
+
+    Returns one of:
+      status: queued | processing | completed | failed
+      stage:  queued | classifying | extracting_concepts | generating_summary |
+              building_materials | finalizing | completed | failed
+      error:  null or error message
+      document_id: the document id
+    """
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    job = get_job(doc_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return job
 
 
 # -----------------------------
