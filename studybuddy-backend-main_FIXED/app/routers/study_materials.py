@@ -19,7 +19,7 @@ from loguru import logger
 
 from ..auth import user_id_from_auth_header
 from ..supabase import supabase
-from ..services.db import new_uuid, insert_quiz, upsert_document
+from ..services.db import new_uuid, insert_quiz, upsert_document, upsert_study_material
 from ..services.auto_study_materials import generate_flashcards
 from ..services.llm import llm
 from ..services.json_utils import safe_json_loads
@@ -298,21 +298,22 @@ async def generate_class_quiz(
         if doc.get("summary"):
             summaries.append(f"## {doc.get('title', 'Document')}\n{doc['summary']}")
 
-    # Also pull class-level concepts from the concepts table if it exists
+    # Also pull class-level concepts from the concepts table
     try:
         concepts_res = (
             supabase.table("concepts")
-            .select("name,importance,description")
+            .select("canonical_name,canonical_description,importance_score")
             .eq("class_id", class_id)
             .execute()
         )
         for c in concepts_res.data or []:
-            if c.get("name") and c["name"] not in seen_names:
-                seen_names.add(c["name"])
+            cname = c.get("canonical_name", "")
+            if cname and cname not in seen_names:
+                seen_names.add(cname)
                 all_concepts.append({
-                    "name": c["name"],
-                    "definition": c.get("description", ""),
-                    "importance": c.get("importance", "important"),
+                    "name": cname,
+                    "definition": c.get("canonical_description", ""),
+                    "importance": c.get("importance_score", 1),
                 })
     except Exception as e:
         logger.warning(f"[generate_class_quiz] concepts table: {e}")
@@ -329,17 +330,16 @@ async def generate_class_quiz(
     quiz_title = f"{class_name} – Class Quiz"
     quiz_json_str = json.dumps(quiz_obj, ensure_ascii=False)
 
+    # Store class-level quiz in study_materials.quiz_questions (quizzes table has no class_id)
     try:
-        insert_quiz(
-            user_id=user_id,
-            doc_id=None,
+        upsert_study_material(
             class_id=class_id,
-            title=quiz_title,
-            quiz_json=quiz_json_str,
-            num_questions=len(questions),
+            material_type="class_quiz",
+            subject_area=(cls_res.data.get("subject_area") or "other").lower(),
+            quiz_questions=quiz_json_str,
         )
     except Exception as e:
-        logger.warning(f"[generate_class_quiz] save quiz: {e}")
+        logger.warning(f"[generate_class_quiz] save to study_materials: {e}")
 
     return {
         "id": quiz_id,
@@ -408,6 +408,17 @@ async def generate_class_flashcards(
         subject_area=subject_area,
     )
 
+    # Persist class-level flashcards to study_materials.flashcards
+    try:
+        upsert_study_material(
+            class_id=class_id,
+            material_type="class_flashcards",
+            subject_area=subject_area,
+            flashcards=json.dumps(cards, ensure_ascii=False),
+        )
+    except Exception as e:
+        logger.warning(f"[generate_class_flashcards] save flashcards: {e}")
+
     return {
         "flashcards": cards,
         "count": len(cards),
@@ -437,19 +448,62 @@ async def get_class_study_materials(
     if not cls_res.data:
         raise HTTPException(status_code=404, detail="Class not found")
 
-    quizzes: List[Dict] = []
+    # Load class-level quiz from study_materials (quizzes table has no class_id column)
+    quiz_available = False
+    quiz_title = ""
+    quiz_question_count = 0
+    quiz_json_cached: Optional[str] = None
+    quiz_generated_at = ""
     try:
-        quizzes_res = (
-            supabase.table("quizzes")
-            .select("id,title,num_questions,created_at")
+        sm_res = (
+            supabase.table("study_materials")
+            .select("id,quiz_questions,generated_at")
             .eq("class_id", class_id)
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
+            .eq("material_type", "class_quiz")
+            .order("generated_at", desc=True)
+            .limit(1)
             .execute()
         )
-        quizzes = quizzes_res.data or []
+        if sm_res.data:
+            row = sm_res.data[0]
+            qj = row.get("quiz_questions")
+            if qj:
+                try:
+                    qobj = json.loads(qj) if isinstance(qj, str) else qj
+                    qs = qobj.get("questions", [])
+                    quiz_available = True
+                    quiz_title = f"{cls_res.data.get('name', 'Class')} – Class Quiz"
+                    quiz_question_count = len(qs)
+                    quiz_generated_at = row.get("generated_at", "")
+                    # Store quiz_json string so frontend can load it inline
+                    quiz_json_cached = qj if isinstance(qj, str) else json.dumps(qj, ensure_ascii=False)
+                except Exception:
+                    pass
     except Exception as e:
-        logger.warning(f"[get_class_study_materials] quizzes: {e}")
+        logger.warning(f"[get_class_study_materials] study_materials: {e}")
+
+    # Load class-level flashcards count from study_materials
+    sm_cards_count = 0
+    try:
+        sm_fc_res = (
+            supabase.table("study_materials")
+            .select("flashcards")
+            .eq("class_id", class_id)
+            .eq("material_type", "class_flashcards")
+            .limit(1)
+            .execute()
+        )
+        if sm_fc_res.data:
+            fc_val = sm_fc_res.data[0].get("flashcards")
+            if fc_val:
+                try:
+                    fc_obj = json.loads(fc_val) if isinstance(fc_val, str) else fc_val
+                    fc_list = fc_obj if isinstance(fc_obj, list) else fc_obj.get("cards", [])
+                    sm_cards_count = len(fc_list)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"[get_class_study_materials] flashcards: {e}")
 
     docs_res = (
         supabase.table("documents")
@@ -458,15 +512,29 @@ async def get_class_study_materials(
         .eq("user_id", user_id)
         .execute()
     )
-    total_cards = sum(
+    doc_cards_count = sum(
         len(_extract_cards_from_json(d.get("cards_json")))
         for d in (docs_res.data or [])
     )
+    total_cards = sm_cards_count if sm_cards_count > 0 else doc_cards_count
+
+    # Build a quiz summary compatible with the frontend's quizzes list shape
+    quizzes: List[Dict] = []
+    if quiz_available:
+        quiz_entry: Dict = {
+            "id": "class_quiz",
+            "title": quiz_title,
+            "num_questions": quiz_question_count,
+            "created_at": quiz_generated_at,
+        }
+        if quiz_json_cached:
+            quiz_entry["quiz_json"] = quiz_json_cached
+        quizzes = [quiz_entry]
 
     return {
         "quizzes": quizzes,
         "flashcard_count": total_cards,
-        "has_quizzes": len(quizzes) > 0,
+        "has_quizzes": quiz_available,
         "has_flashcards": total_cards > 0,
     }
 
@@ -499,7 +567,6 @@ async def generate_document_quiz(
 
     doc = doc_res.data
     title = doc.get("title", "Document")
-    class_id = doc.get("class_id")
 
     concepts = _extract_concepts_from_guide(doc.get("guide_json"))
     summary = doc.get("summary") or ""
@@ -516,11 +583,11 @@ async def generate_document_quiz(
     quiz_title = f"{title} – Quiz"
     quiz_json_str = json.dumps(quiz_obj, ensure_ascii=False)
 
+    # Store document-level quiz in quizzes table using doc_id (no class_id on quizzes)
     try:
         insert_quiz(
             user_id=user_id,
             doc_id=doc_id,
-            class_id=class_id,
             title=quiz_title,
             quiz_json=quiz_json_str,
             num_questions=len(questions),

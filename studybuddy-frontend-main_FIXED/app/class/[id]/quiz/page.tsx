@@ -13,6 +13,7 @@ type QuizMeta = {
   title: string;
   num_questions: number;
   created_at: string;
+  quiz_json?: string;
 };
 
 export default function ClassQuizPage() {
@@ -82,19 +83,28 @@ export default function ClassQuizPage() {
     }
   }
 
-  async function openSavedQuiz(quizId: string) {
-    const { data } = await supabase
-      .from("quizzes")
-      .select("title,quiz_json")
-      .eq("id", quizId)
-      .maybeSingle();
-    if (!data) return;
+  async function openSavedQuiz(quiz: QuizMeta) {
+    // Class-level quizzes are stored in study_materials (not the quizzes table).
+    // quiz_json is returned inline from getClassStudyMaterials when available.
+    let quizJsonSource: string | null = quiz.quiz_json ?? null;
+
+    if (!quizJsonSource) {
+      // Fallback: load document-level quiz from the quizzes table
+      const { data } = await supabase
+        .from("quizzes")
+        .select("title,quiz_json")
+        .eq("id", quiz.id)
+        .maybeSingle();
+      quizJsonSource = data?.quiz_json ?? null;
+    }
+
+    if (!quizJsonSource) return;
     try {
-      const parsed = typeof data.quiz_json === "string"
-        ? JSON.parse(data.quiz_json)
-        : data.quiz_json;
+      const parsed = typeof quizJsonSource === "string"
+        ? JSON.parse(quizJsonSource)
+        : quizJsonSource;
       const qs: MCQ[] = parsed.questions || [];
-      setActiveQuiz({ title: data.title, questions: qs });
+      setActiveQuiz({ title: quiz.title, questions: qs });
       setPicked(new Array(qs.length).fill(-1));
     } catch {
       setError("Could not load quiz.");
@@ -173,7 +183,7 @@ export default function ClassQuizPage() {
               {quizzes.map((q) => (
                 <button
                   key={q.id}
-                  onClick={() => openSavedQuiz(q.id)}
+                  onClick={() => openSavedQuiz(q)}
                   className="saved-card"
                 >
                   <div className="saved-card-icon">📝</div>
