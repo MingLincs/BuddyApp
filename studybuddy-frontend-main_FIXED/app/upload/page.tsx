@@ -1,12 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { API_BASE } from "@/lib/env";
 
 type ClassRow = { id: string; name: string; created_at: string };
-type Status = "idle" | "uploading" | "done" | "error";
+type UploadStatus = "idle" | "uploading" | "processing" | "done" | "error";
+
+const STAGE_LABELS: Record<string, string> = {
+  queued: "Queued…",
+  extracting: "Extracting text…",
+  classifying: "Classifying document…",
+  building: "Building study materials…",
+  finalizing: "Finalising…",
+};
+
+const STAGE_ORDER = ["extracting", "classifying", "building", "finalizing"];
 
 export default function IntelligentUploadPage() {
   const router = useRouter();
@@ -14,11 +24,13 @@ export default function IntelligentUploadPage() {
   const [classes, setClasses] = useState<ClassRow[]>([]);
   const [classId, setClassId] = useState<string>("");
   const [newClassName, setNewClassName] = useState("");
-  const [status, setStatus] = useState<Status>("idle");
+  const [status, setStatus] = useState<UploadStatus>("idle");
+  const [stage, setStage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<any>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const canUpload = !!file && !!classId && status !== "uploading";
+  const canUpload = !!file && !!classId && status !== "uploading" && status !== "processing";
 
   const loadClasses = useMemo(
     () => async () => {
@@ -40,6 +52,13 @@ export default function IntelligentUploadPage() {
   useEffect(() => {
     loadClasses();
   }, [loadClasses]);
+
+  // Clean up polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
 
   const createClass = async () => {
     const name = newClassName.trim();
@@ -69,9 +88,40 @@ export default function IntelligentUploadPage() {
     }
   };
 
+  const pollStatus = (docId: string, token: string, resolvedClassId: string) => {
+    if (pollRef.current) clearInterval(pollRef.current);
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/intelligent/process-status/${docId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return; // transient; keep polling
+
+        const data = await res.json();
+        setStage(data.stage || "");
+
+        if (data.status === "completed") {
+          clearInterval(pollRef.current!);
+          pollRef.current = null;
+          setResult({ ...data, class_id: resolvedClassId });
+          setStatus("done");
+        } else if (data.status === "failed") {
+          clearInterval(pollRef.current!);
+          pollRef.current = null;
+          setError(data.error || "Processing failed. Please try again.");
+          setStatus("error");
+        }
+      } catch {
+        // network blip; keep polling
+      }
+    }, 2500);
+  };
+
   const handleIntelligentUpload = async () => {
     if (!file || !classId) return;
     setStatus("uploading");
+    setStage("");
     setError(null);
     setResult(null);
 
@@ -83,7 +133,6 @@ export default function IntelligentUploadPage() {
       const fd = new FormData();
       fd.append("file", file);
 
-      // Use the NEW intelligent endpoint
       const res = await fetch(`${API_BASE}/intelligent/process-document/${classId}`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
@@ -96,13 +145,27 @@ export default function IntelligentUploadPage() {
       }
 
       const data = await res.json();
-      setResult(data);
-      setStatus("done");
+
+      // If already completed (duplicate detected), go straight to done
+      if (data.status === "completed") {
+        setResult({ ...data, class_id: classId });
+        setStatus("done");
+        return;
+      }
+
+      // Start polling for background progress
+      setStatus("processing");
+      setStage("queued");
+      pollStatus(data.document_id, token, classId);
     } catch (e: unknown) {
       setStatus("error");
       setError(e instanceof Error ? e.message : "Upload failed");
     }
   };
+
+  const stageLabel =
+    STAGE_LABELS[stage] ||
+    (status === "uploading" ? "Uploading file…" : status === "processing" ? "Processing…" : "");
 
   return (
     <>
@@ -222,15 +285,34 @@ export default function IntelligentUploadPage() {
             disabled={!canUpload}
             className="upload-button"
           >
-            {status === "uploading" ? (
+            {status === "uploading" || status === "processing" ? (
               <>
                 <span className="button-spinner"></span>
-                Processing with AI...
+                {stageLabel || "Processing with AI…"}
               </>
             ) : (
               "🚀 Upload & Process"
             )}
           </button>
+
+          {/* Processing progress */}
+          {status === "processing" && (
+            <div className="progress-box">
+              <div className="progress-steps">
+                {STAGE_ORDER.map((s) => (
+                  <div
+                    key={s}
+                    className={`progress-step ${stage === s ? "active" : ""} ${
+                      STAGE_ORDER.indexOf(stage) > STAGE_ORDER.indexOf(s) ? "done" : ""
+                    }`}
+                  >
+                    <span className="step-dot"></span>
+                    <span className="step-label">{STAGE_LABELS[s]}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Error */}
           {error && (
@@ -244,19 +326,19 @@ export default function IntelligentUploadPage() {
             <div className="success-message">
               <div className="success-header">
                 <span>✅</span>
-                <strong>{result.message}</strong>
+                <strong>
+                  {result.document_type === "syllabus"
+                    ? "Syllabus processed successfully!"
+                    : "Document processed successfully!"}
+                </strong>
               </div>
 
               {result.document_type === "syllabus" && (
                 <div className="success-details">
                   <h4>Syllabus Processed!</h4>
-                  <p>
-                    • {result.syllabus_summary?.weeks} weeks scheduled<br />
-                    • {result.syllabus_summary?.assessments} assessments tracked<br />
-                    • Complete study timeline created
-                  </p>
+                  <p>Your semester timeline and study plan have been created.</p>
                   <button
-                    onClick={() => router.push(`/class/${classId}/dashboard`)}
+                    onClick={() => router.push(`/class/${result.class_id ?? classId}/dashboard`)}
                     className="view-dashboard-button"
                   >
                     View Your Study Plan →
@@ -264,23 +346,19 @@ export default function IntelligentUploadPage() {
                 </div>
               )}
 
-              {result.document_type !== "syllabus" && result.stats && (
+              {result.document_type !== "syllabus" && (
                 <div className="success-details">
-                  <h4>Materials Generated!</h4>
-                  <p>
-                    • {result.stats.concepts_extracted} concepts extracted<br />
-                    • {result.stats.flashcards_created} flashcards created<br />
-                    • {result.stats.quiz_questions} quiz questions generated
-                  </p>
+                  <h4>Study Materials Ready!</h4>
+                  <p>Flashcards, study guide, and concept map have been generated.</p>
                   <div className="success-actions">
                     <button
-                      onClick={() => router.push(`/class/${classId}/flashcards`)}
+                      onClick={() => router.push(`/class/${result.class_id ?? classId}/flashcards`)}
                       className="action-button"
                     >
                       🎴 Study Flashcards
                     </button>
                     <button
-                      onClick={() => router.push(`/class/${classId}/concept-map`)}
+                      onClick={() => router.push(`/class/${result.class_id ?? classId}/concept-map`)}
                       className="action-button"
                     >
                       🗺️ View Concept Map
@@ -590,6 +668,54 @@ export default function IntelligentUploadPage() {
 
         @keyframes spin {
           to { transform: rotate(360deg); }
+        }
+
+        .progress-box {
+          margin-top: 16px;
+          padding: 16px 20px;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+        }
+
+        .progress-steps {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+        }
+
+        .progress-step {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          color: #94a3b8;
+          font-size: 14px;
+        }
+
+        .progress-step.active {
+          color: #3b82f6;
+          font-weight: 600;
+        }
+
+        .progress-step.done {
+          color: #10b981;
+        }
+
+        .step-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: currentColor;
+          flex-shrink: 0;
+        }
+
+        .progress-step.active .step-dot {
+          animation: pulse 1s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
         }
 
         .error-message {
